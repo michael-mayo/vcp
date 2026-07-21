@@ -1,0 +1,10 @@
+# Core data handling
+pandas>=3.0.3
+
+# Symbol universe: NASDAQ screener + Wikipedia (S&P membership)
+curl_cffi>=0.15.0     # browser-impersonating HTTP client (avoids bot blocks)
+lxml>=6.1.1           # HTML table parsing for pandas.read_html
+
+# Price history from Yahoo Finance
+yfinance>=1.5.1
+scipy>=1.18.0         # required by yfinance's repair=True (data-glitch fixes)

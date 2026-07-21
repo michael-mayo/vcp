@@ -30,7 +30,7 @@ import json
 import time
 import random
 from io import StringIO
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import yfinance as yf
@@ -59,6 +59,7 @@ PRICE_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 PRICE_MAX_WORKERS = 4          # concurrent downloads; Yahoo throttles bursts
 PRICE_MAX_RETRIES = 4          # attempts per symbol (an empty result is retried)
 PRICE_SWEEP_COOLDOWN = 10.0    # seconds to pause before the final retry sweep
+PRICE_PROGRESS_EVERY = 25      # print a progress line every N completed downloads
 
 NASDAQ_STOCKS_URL = "https://api.nasdaq.com/api/screener/stocks"
 SP_PAGES = {
@@ -300,7 +301,8 @@ def _download_prices(yahoo_symbol: str, *, retries: int | None = None) -> pd.Dat
                 yahoo_symbol,
                 start=start,
                 interval="1d",
-                auto_adjust=True,      # split/dividend-adjusted OHLC
+                auto_adjust=True,      # fully split/dividend-adjusted OHLC
+                repair=True,           # fix Yahoo glitches (unit errors, missing splits)
                 actions=False,
                 progress=False,
                 threads=False,
@@ -330,23 +332,40 @@ def _download_prices(yahoo_symbol: str, *, retries: int | None = None) -> pd.Dat
     return pd.DataFrame(columns=PRICE_COLUMNS)
 
 
-def _download_many(symbols, max_workers: int) -> dict:
-    """Download a batch of symbols concurrently, returning {symbol: DataFrame}.
+def _download_and_cache(symbols, manifest: dict, years, max_workers: int,
+                        label: str = "download") -> dict:
+    """Download symbols concurrently, caching each the instant it completes.
 
-    Never raises for an individual symbol: any failure yields an empty frame,
-    so the caller can decide what to retry.
+    Every non-empty result is written to its cache file and recorded in
+    ``manifest`` immediately (the manifest is persisted periodically), so an
+    interrupted run keeps all downloads finished so far and is resumable.
+    Progress (saved / no-data / outstanding) is printed every
+    :data:`PRICE_PROGRESS_EVERY` completions. Returns {symbol: DataFrame}
+    (an empty frame for symbols that yielded no data).
     """
-    workers = max(1, min(max_workers, len(symbols)))
+    total = len(symbols)
+    workers = max(1, min(max_workers, total))
     results: dict[str, pd.DataFrame] = {}
+    done = saved = 0
+    print(f"[{label}] starting {total} symbol(s) with {workers} workers")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_download_prices, sym): sym for sym in symbols}
-        for fut in futures:
+        for fut in as_completed(futures):
             sym = futures[fut]
             try:
-                results[sym] = fut.result()
-            except Exception as err:  # noqa: BLE001 - defensive; _download_prices swallows
-                print(f"warning: could not download {sym}: {err}")
-                results[sym] = pd.DataFrame(columns=PRICE_COLUMNS)
+                df = fut.result()
+            except Exception:  # noqa: BLE001 - defensive; _download_prices swallows
+                df = pd.DataFrame(columns=PRICE_COLUMNS)
+            if not df.empty:
+                df.to_csv(_price_cache_path(sym))          # save immediately
+                manifest[sym] = {"history_years": years}
+                saved += 1
+            results[sym] = df
+            done += 1
+            if done % PRICE_PROGRESS_EVERY == 0 or done == total:
+                _save_manifest(manifest)                   # persist progress
+                print(f"[{label}] {saved} saved, {done - saved} no-data, "
+                      f"{total - done} outstanding ({done}/{total})")
     return results
 
 
@@ -424,31 +443,33 @@ def get_symbol_price_data(symbols=("QQQ",), refresh: bool = False) -> dict:
         else:
             to_download.append(sym)
 
-    # Download the outstanding symbols concurrently.
+    # Download the outstanding symbols, caching each the instant it completes.
     if to_download:
         max_workers = config.get("price.max_workers", PRICE_MAX_WORKERS)
-        downloaded = _download_many(to_download, max_workers)
+        downloaded = _download_and_cache(to_download, manifest, years,
+                                         max_workers, label="download")
 
         # Sweep: symbols that came back empty are more often throttled than
-        # truly dataless, so retry them once after a cooldown, at low
-        # concurrency, before giving up.
+        # truly dataless, so retry them once after a cooldown, at low concurrency.
         empties = [s for s, df in downloaded.items() if df.empty]
         if empties:
             cooldown = config.get("price.sweep_cooldown", PRICE_SWEEP_COOLDOWN)
             print(f"retrying {len(empties)} symbol(s) with no data after "
                   f"{cooldown:.0f}s cooldown...")
             time.sleep(cooldown)
-            downloaded.update(_download_many(empties, max_workers=min(2, len(empties))))
+            downloaded.update(_download_and_cache(empties, manifest, years,
+                                                  min(2, len(empties)), label="sweep"))
 
         for sym in to_download:
-            df = downloaded[sym]
-            if df.empty:
-                print(f"warning: no price data returned for {sym}")
-            else:
-                df.to_csv(_price_cache_path(sym))
-                manifest[sym] = {"history_years": years}
-            result[sym] = df
-        _save_manifest(manifest)
+            result[sym] = downloaded[sym]
+
+        failed = [s for s in to_download if downloaded[s].empty]
+        if failed:
+            preview = ", ".join(failed[:20]) + (" ..." if len(failed) > 20 else "")
+            print(f"finished: {len(to_download) - len(failed)} saved, "
+                  f"{len(failed)} returned no data: {preview}")
+        else:
+            print(f"finished: all {len(to_download)} symbol(s) saved to cache")
 
     # Preserve the requested order.
     return {sym: result[sym] for sym in yahoo_symbols}
@@ -499,14 +520,13 @@ def _print_symbols(df: pd.DataFrame) -> None:
 
 
 def _print_prices(data: dict) -> None:
-    pd.set_option("display.max_rows", 20)
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.width", None)
+    """Print a compact summary: one line per ticker with its daily-record count."""
+    print(f"\n{'symbol':<10}{'records':>10}")
+    total = 0
     for sym, df in data.items():
-        print(f"\n===== {sym}  ({len(df)} rows"
-              + (f", {df.index.min().date()} -> {df.index.max().date()}" if not df.empty else "")
-              + ") =====")
-        print(df)
+        print(f"{sym:<10}{len(df):>10}")
+        total += len(df)
+    print(f"\n{len(data)} symbol(s), {total} total daily records")
 
 
 def _main(argv) -> int:

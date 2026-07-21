@@ -16,10 +16,12 @@ Everything runs in the `vcp` conda environment:
 
 ```bash
 conda activate vcp
+pip install -r requirements.txt
 ```
 
-Dependencies (already installed in that env): `pandas`, `yfinance`, `curl_cffi`,
-`lxml`.
+Dependencies: `pandas`, `curl_cffi`, `lxml` (symbol universe) and `yfinance`,
+`scipy` (price history — `scipy` backs yfinance's data-glitch repair). See
+`requirements.txt`.
 
 ## Configuration — `vcp.json`
 

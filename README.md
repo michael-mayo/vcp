@@ -8,7 +8,7 @@ Patterns. Two modules, each usable from Python and the command line:
 |---|---|---|
 | `data` | `get_symbols` | The universe of US stocks + metadata, filtered per `vcp.json` |
 | `data` | `get_symbol_price_data` | ~20 years of daily OHLCV for one or more symbols |
-| `vcp` | `get_symbol_price_data` | One symbol's OHLCV enriched with Range and EMAs |
+| `vcp` | `get_symbol_price_data` | One symbol's OHLCV enriched with Range, EMAs, a VC score, and optional plotting |
 
 ## Setup
 
@@ -42,7 +42,9 @@ All programs read shared settings from `vcp.json`:
   },
   "vcp": {
     "ema_short_period": 10,
-    "ema_long_period": 20
+    "ema_long_period": 20,
+    "alpha": 1.0,
+    "beta": 1.0
   }
 }
 ```
@@ -52,7 +54,9 @@ All programs read shared settings from `vcp.json`:
   full universe is cached; filters are applied on read).
 - **`price`** — `history_years` sets the download look-back; the rest tune the
   Yahoo Finance download (concurrency, retries, and the rate-limit sweep).
-- **`vcp`** — the two EMA periods used by `vcp.get_symbol_price_data`.
+- **`vcp`** — used by `vcp.get_symbol_price_data`: the two EMA periods
+  (`ema_short_period`, `ema_long_period`) and the `alpha` / `beta` exponents
+  (both default `1.0`) that weight the Range and Volume terms of the `VC` score.
 
 ---
 
@@ -122,7 +126,7 @@ python data.py get_symbol_price_data symbols=all refresh=True
 
 ---
 
-## 3. `vcp.get_symbol_price_data` — Range & EMAs
+## 3. `vcp.get_symbol_price_data` — Range, EMAs & VC
 
 The analysis layer. Loads a **single** symbol's adjusted OHLCV (via
 `data.get_symbol_price_data`) and adds derived columns:
@@ -131,11 +135,36 @@ The analysis layer. Loads a **single** symbol's adjusted OHLCV (via
 - **Short- and long-period EMAs** of `Close`, `Range`, and `Volume`:
   `Close_EMA_short`, `Close_EMA_long`, `Range_EMA_short`, `Range_EMA_long`,
   `Volume_EMA_short`, `Volume_EMA_long`
+- **`VC`** — a volatility-contraction score (see below)
 
 The two EMA periods come from the `vcp` section of `vcp.json`
 (`ema_short_period`, `ema_long_period`; defaults 10 and 20). EMAs use the
 standard `ewm(span=period, adjust=False)` (seeded at the first value). Full
-columns: `Open, High, Low, Close, Volume, Range` + the 6 EMAs.
+columns: `Open, High, Low, Close, Volume, Range` + the 6 EMAs + `VC`.
+
+#### The `VC` score
+
+`VC` combines how much recent **range** and **volume** have contracted relative
+to their own longer-term baselines:
+
+```
+VC = 1 − (Range_EMA_short / Range_EMA_long) ** alpha
+       × (Volume_EMA_short / Volume_EMA_long) ** beta
+```
+
+Each factor is a fast/slow EMA ratio centred on 1 (recent vs. baseline), raised
+to its exponent from `vcp.json` (`alpha` for range, `beta` for volume; both
+default `1.0`). The product is flipped via `1 − …` so the sign reads intuitively:
+
+- **`VC > 0`** → range **and** volume are contracting (the product < 1) — the
+  quiet, tightening state a VCP setup is built on.
+- **`VC < 0`** → expansion (elevated range and/or volume) — e.g. a high-volume
+  breakout or sharp selloff.
+- **`VC ≈ 0`** → neutral (recent ≈ baseline).
+
+`alpha` / `beta` weight the two dimensions; setting one to `0` drops that factor
+out entirely (it becomes a constant `1`), leaving a pure range- or volume-based
+score.
 
 > Note: `vcp.get_symbol_price_data` takes **one** `symbol` and returns a
 > `DataFrame`; `data.get_symbol_price_data` takes a list of `symbols` and returns
@@ -148,9 +177,17 @@ import vcp
 
 df = vcp.get_symbol_price_data("MSFT")                # from cache
 df = vcp.get_symbol_price_data("MSFT", refresh=True)  # force re-download
+
+# Also save a two-panel chart (Close + EMAs on top, VC below):
+df = vcp.get_symbol_price_data("MSFT", plot_filename="msft.png")
+df = vcp.get_symbol_price_data("MSFT", plot_filename="msft.png",
+                               plot_from_rec=-100, plot_to_rec=-1)
 ```
 
-Returns a pandas `DataFrame` indexed by `Date`.
+Returns a pandas `DataFrame` indexed by `Date`. The API call is silent (no
+console output); pass `plot_filename` to also write a chart. `plot_from_rec` /
+`plot_to_rec` are inclusive record positions (negative counts from the end;
+defaults `-252` to `-1`, the last ~year). Requires `matplotlib`.
 
 ### From the command line
 
@@ -160,6 +197,21 @@ python vcp.py get_symbol_price_data symbol=MSFT refresh=True
 ```
 
 Prints the enriched table with a record-count / date-range footer.
+
+Pass `plot_filename=...` to save a two-panel chart (Close + EMAs on top, the VC
+score below) instead of just printing; `plot_from_rec` / `plot_to_rec` select the
+record range (defaults `-252` to `-1`, i.e. the last ~year):
+
+```bash
+python vcp.py get_symbol_price_data symbol=MSFT plot_filename=msft.png
+python vcp.py get_symbol_price_data symbol=MSFT plot_filename=msft.png plot_from_rec=-100 plot_to_rec=-1
+```
+
+Handy one-liner — clear old charts, plot a symbol, and open it:
+
+```bash
+rm *.png && SYMBOL=IBKR && python vcp.py get_symbol_price_data symbol=$SYMBOL plot_filename=$SYMBOL.png && eog $SYMBOL.png
+```
 
 ---
 

@@ -6,6 +6,7 @@ OHLCV price history (via :mod:`data`) and enriches it with:
   * ``Range``             — the daily high-low range (High - Low)
   * ``<src>_EMA_short``   — short-period EMA of ``Close``, ``Range``, ``Volume``
   * ``<src>_EMA_long``    — long-period EMA of ``Close``, ``Range``, ``Volume``
+  * ``ADR``               — Average Daily Range percent over ``adr_period`` days
   * ``VC``                — volatility-contraction score combining the fast/slow
                             Range and Volume EMA ratios (see below)
 
@@ -44,6 +45,9 @@ import config
 EMA_SOURCES = ("Close", "Range", "Volume")
 EMA_SHORT_PERIOD = 10  # fallback if not in vcp.json ("vcp.ema_short_period")
 EMA_LONG_PERIOD = 20   # fallback if not in vcp.json ("vcp.ema_long_period")
+
+# Look-back for the Average Daily Range percent (ADR) column.
+ADR_PERIOD = 20  # fallback if not in vcp.json ("vcp.adr_period")
 
 # Exponents applied to the Range and Volume EMA ratios when forming the VC column.
 VC_ALPHA = 1.0  # fallback if not in vcp.json ("vcp.alpha")
@@ -84,7 +88,8 @@ def get_symbol_price_data(
     -------
     pandas.DataFrame
         Indexed by ``Date`` with columns ``Open, High, Low, Close, Volume,
-        Range``, the EMA columns (e.g. ``Close_EMA_short``, ``Volume_EMA_long``)
+        Range``, the EMA columns (e.g. ``Close_EMA_short``, ``Volume_EMA_long``),
+        ``ADR`` — the Average Daily Range percent over ``vcp.adr_period`` days —
         and ``VC`` — the volatility-contraction score
         ``1 - (Range_EMA_short/Range_EMA_long)**alpha *
         (Volume_EMA_short/Volume_EMA_long)**beta`` (``alpha``/``beta`` from the
@@ -104,6 +109,11 @@ def get_symbol_price_data(
     for source in EMA_SOURCES:
         df[f"{source}_EMA_short"] = df[source].ewm(span=short, adjust=False).mean()
         df[f"{source}_EMA_long"] = df[source].ewm(span=long, adjust=False).mean()
+
+    # Average Daily Range percent: mean of the daily High/Low ratio over the
+    # look-back window, expressed as a percentage (Minervini-style ADR%).
+    adr_period = config.get("vcp.adr_period", ADR_PERIOD)
+    df["ADR"] = ((df["High"] / df["Low"]).rolling(adr_period).mean() - 1.0) * 100.0
 
     # Volatility-contraction score: fast/slow EMA ratios of Range and Volume,
     # each raised to its configured exponent and multiplied, then flipped to

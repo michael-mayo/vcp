@@ -13,6 +13,7 @@
   "vcp": {
     "ema_short_period": 10,
     "ema_long_period": 20,
+    "adr_period": 20,
     "alpha": 1.0,
     "beta": 1.0
   }

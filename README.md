@@ -43,6 +43,7 @@ All programs read shared settings from `vcp.json`:
   "vcp": {
     "ema_short_period": 10,
     "ema_long_period": 20,
+    "adr_period": 20,
     "alpha": 1.0,
     "beta": 1.0
   }
@@ -55,8 +56,9 @@ All programs read shared settings from `vcp.json`:
 - **`price`** — `history_years` sets the download look-back; the rest tune the
   Yahoo Finance download (concurrency, retries, and the rate-limit sweep).
 - **`vcp`** — used by `vcp.get_symbol_price_data`: the two EMA periods
-  (`ema_short_period`, `ema_long_period`) and the `alpha` / `beta` exponents
-  (both default `1.0`) that weight the Range and Volume terms of the `VC` score.
+  (`ema_short_period`, `ema_long_period`), the `adr_period` look-back for the
+  `ADR` score, and the `alpha` / `beta` exponents (both default `1.0`) that
+  weight the Range and Volume terms of the `VC` score.
 
 ---
 
@@ -126,7 +128,7 @@ python data.py get_symbol_price_data symbols=all refresh=True
 
 ---
 
-## 3. `vcp.get_symbol_price_data` — Range, EMAs & VC
+## 3. `vcp.get_symbol_price_data` — Range, EMAs, ADR & VC
 
 The analysis layer. Loads a **single** symbol's adjusted OHLCV (via
 `data.get_symbol_price_data`) and adds derived columns:
@@ -135,12 +137,25 @@ The analysis layer. Loads a **single** symbol's adjusted OHLCV (via
 - **Short- and long-period EMAs** of `Close`, `Range`, and `Volume`:
   `Close_EMA_short`, `Close_EMA_long`, `Range_EMA_short`, `Range_EMA_long`,
   `Volume_EMA_short`, `Volume_EMA_long`
+- **`ADR`** — Average Daily Range percent (see below)
 - **`VC`** — a volatility-contraction score (see below)
 
 The two EMA periods come from the `vcp` section of `vcp.json`
 (`ema_short_period`, `ema_long_period`; defaults 10 and 20). EMAs use the
 standard `ewm(span=period, adjust=False)` (seeded at the first value). Full
-columns: `Open, High, Low, Close, Volume, Range` + the 6 EMAs + `VC`.
+columns: `Open, High, Low, Close, Volume, Range` + the 6 EMAs + `ADR` + `VC`.
+
+#### The `ADR` score
+
+`ADR` is the **Average Daily Range percent** — how much the stock swings
+high-to-low on a typical day, averaged over `adr_period` days (default 20):
+
+```
+ADR = 100 × (meanₙ(High / Low) − 1)
+```
+
+A higher value means a wider-swinging (more volatile) stock. It's a common
+liquidity/volatility filter in VCP screening.
 
 #### The `VC` score
 

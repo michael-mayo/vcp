@@ -2,13 +2,14 @@
 
 Tooling for downloading/caching US stock market data (NASDAQ screener, Wikipedia
 S&P membership, Yahoo Finance) and analysing it for Volatility Contraction
-Patterns. Two modules, each usable from Python and the command line:
+Patterns. Three modules, each usable from Python and the command line:
 
 | Module | Command | What it does |
 |---|---|---|
 | `data` | `get_symbols` | The universe of US stocks + metadata, filtered per `vcp.json` |
 | `data` | `get_symbol_price_data` | ~20 years of daily OHLCV for one or more symbols |
 | `vcp` | `get_symbol_price_data` | One symbol's OHLCV enriched with EMAs, ADR%, contraction signals & a `VCP` score, plus optional plotting |
+| `rank` | `rank` | The filtered universe screened by momentum & `VCP_Rank`, ranked strongest-first |
 
 ## Setup
 
@@ -45,6 +46,11 @@ All programs read shared settings from `vcp.json`:
     "ema_long_period": 20,
     "adr_period": 20,
     "signal_rank_period": 500
+  },
+  "rank": {
+    "momentum_period": 242,
+    "momentum_filter": 30,
+    "min_vcp": 90
   }
 }
 ```
@@ -59,6 +65,10 @@ All programs read shared settings from `vcp.json`:
   `adr_period` look-back for the `ADR` score (default `20`), and
   `signal_rank_period` — the trailing window (trading days) for the percentile
   rank of each signal line and of the composite `VCP` (default `500`).
+- **`rank`** — used by `rank.rank`: `momentum_period` — the trailing window
+  (trading days) for the "n-day low" (default `242` ≈ one year); `momentum_filter`
+  — the minimum percent above that low a stock must be (default `30`); and
+  `min_vcp` — the minimum latest `VCP_Rank` a stock must have (default `90`).
 
 ---
 
@@ -271,9 +281,64 @@ rm *.png && SYMBOL=IBKR && python vcp.py get_symbol_price_data symbol=$SYMBOL pl
 
 ---
 
+## 4. `rank` — momentum + `VCP_Rank` screen
+
+The screening layer. Builds on `data` (whose `vcp.json` `filters` already remove
+illiquid stocks) and ranks the survivors:
+
+1. Pull the filtered universe and its price history (from cache, or freshly
+   downloaded when `refresh=True`).
+2. **Momentum** = how far the latest `Close` sits above the lowest `Low` of the
+   trailing `momentum_period` days (default `242` ≈ one year — effectively
+   "percent above the 52-week low").
+3. Keep stocks at least `momentum_filter` percent (default `30`) above that low
+   **and** whose latest `VCP_Rank` (from `vcp`) is at least `min_vcp` (default
+   `90`), and return them ranked by momentum, strongest first.
+
+**Columns:** `symbol, sector, last_close, period_low, pct_above_low, VCP_Rank`,
+indexed by `rank` (1 = strongest). `sector` comes from `get_symbols`;
+`period_low` is the trailing `momentum_period` low; `pct_above_low` is the
+momentum measure (percent); `VCP_Rank` is the latest contraction percentile.
+
+> **On the momentum filter:** "percent above the n-day low" is a naturally high,
+> right-skewed quantity — the low is a hard one-year floor, so the median stock
+> sits ~40% above it. A `30` threshold is therefore a *loose* pre-filter that
+> mainly drops laggards still hugging their lows; `min_vcp` (default `90`,
+> i.e. top-decile contraction) does the selective cut.
+
+> **Minimum history:** each survivor's `VCP_Rank` needs roughly two stacked
+> `signal_rank_period` windows (~1000 trading days) of history; symbols with
+> less are dropped from the ranking.
+
+### From Python
+
+```python
+import rank
+
+df = rank.rank()               # from cache
+df = rank.rank(refresh=True)   # re-download universe + prices first
+```
+
+Returns a pandas `DataFrame` (empty if nothing clears the filters). The thresholds
+are read from the `rank` section of `vcp.json`. Computing `VCP_Rank` across the
+survivors takes roughly one to two minutes.
+
+### From the command line
+
+```bash
+python rank.py                 # refresh defaults to False
+python rank.py refresh=True
+```
+
+Prints the ranked table with a footer noting the active thresholds. Tune
+`momentum_period` / `momentum_filter` / `min_vcp` in `vcp.json`.
+
+---
+
 ## `refresh` and caching
 
-Both commands share the same caching rule:
+Every command shares the same caching rule (`rank` passes `refresh` straight
+through to the `data` layer):
 
 - **`refresh=False`** (default) — load from cache if present; download (and cache)
   only what's missing.

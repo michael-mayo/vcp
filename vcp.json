@@ -15,5 +15,10 @@
     "ema_long_period": 20,
     "adr_period": 20,
     "signal_rank_period": 500
+  },
+  "rank": {
+    "momentum_period": 242,
+    "momentum_filter": 30,
+    "min_vcp": 90
   }
 }

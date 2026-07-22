@@ -1,3 +1,4 @@
+*.png
 .claude
 __pycache__/
 cache/

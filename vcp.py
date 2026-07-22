@@ -58,6 +58,9 @@ VC_BETA = 1.0   # fallback if not in vcp.json ("vcp.beta")
 # Trailing window (trading days) for the VCRank percentile of VC.
 VC_RANK_PERIOD = 504  # fallback if not in vcp.json ("vcp.vc_rank_period")
 
+# VCRank level marking "strong contraction" (drawn as the plot's reference line).
+VC_RANK_THRESHOLD = 80  # fallback if not in vcp.json ("vcp.vc_rank_threshold")
+
 
 # --------------------------------------------------------------------------- #
 # Public API
@@ -149,8 +152,10 @@ def get_symbol_price_data(
     df = df.dropna(subset=["VCRank"])
 
     if plot_filename and not df.empty:
+        threshold = config.get("vcp.vc_rank_threshold", VC_RANK_THRESHOLD)
         _save_close_ema_plot(
-            df, symbol, plot_filename, plot_from_rec, plot_to_rec, short, long
+            df, symbol, plot_filename, plot_from_rec, plot_to_rec, short, long,
+            threshold,
         )
     return df
 
@@ -169,6 +174,7 @@ def _save_close_ema_plot(
     to_rec: int,
     short: int,
     long: int,
+    rank_threshold: float,
 ) -> None:
     """Save a Close-price + Close-EMA plot of ``df[from_rec:to_rec]`` to disk.
 
@@ -202,9 +208,10 @@ def _save_close_ema_plot(
     ax_price.grid(True, alpha=0.3)
 
     ax_vc.plot(window.index, window["VCRank"], label="VCRank", color="tab:purple", linewidth=1.0)
-    ax_vc.axhline(50.0, color="black", linewidth=0.8)  # median: above = more contracted than usual
-    # Shade the above-median contraction region (VCRank > 50) green.
-    ax_vc.fill_between(window.index, window["VCRank"], 50.0, where=window["VCRank"] > 50,
+    ax_vc.axhline(rank_threshold, color="black", linewidth=0.8)  # strong-contraction threshold
+    # Shade the strong-contraction region (VCRank > threshold) green.
+    ax_vc.fill_between(window.index, window["VCRank"], rank_threshold,
+                       where=window["VCRank"] > rank_threshold,
                        color="tab:green", alpha=0.25, interpolate=True,
                        label="contraction")
     ax_vc.set_ylabel("VCRank")

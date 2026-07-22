@@ -45,7 +45,9 @@ All programs read shared settings from `vcp.json`:
     "ema_long_period": 20,
     "adr_period": 20,
     "alpha": 1.0,
-    "beta": 1.0
+    "beta": 1.0,
+    "vc_rank_period": 504,
+    "vc_rank_threshold": 80
   }
 }
 ```
@@ -57,8 +59,10 @@ All programs read shared settings from `vcp.json`:
   Yahoo Finance download (concurrency, retries, and the rate-limit sweep).
 - **`vcp`** — used by `vcp.get_symbol_price_data`: the two EMA periods
   (`ema_short_period`, `ema_long_period`), the `adr_period` look-back for the
-  `ADR` score, and the `alpha` / `beta` exponents (both default `1.0`) that
-  weight the Range and Volume terms of the `VC` score.
+  `ADR` score, the `alpha` / `beta` exponents (both default `1.0`) that weight
+  the Range and Volume terms of the `VC` score, and the `vc_rank_period` /
+  `vc_rank_threshold` settings for the `VCRank` percentile (trailing window and
+  the plot's strong-contraction line; defaults `504` and `80`).
 
 ---
 
@@ -128,7 +132,7 @@ python data.py get_symbol_price_data symbols=all refresh=True
 
 ---
 
-## 3. `vcp.get_symbol_price_data` — Range, EMAs, ADR & VC
+## 3. `vcp.get_symbol_price_data` — Range, EMAs, ADR, VC & VCRank
 
 The analysis layer. Loads a **single** symbol's adjusted OHLCV (via
 `data.get_symbol_price_data`) and adds derived columns:
@@ -139,11 +143,13 @@ The analysis layer. Loads a **single** symbol's adjusted OHLCV (via
   `Volume_EMA_short`, `Volume_EMA_long`
 - **`ADR`** — Average Daily Range percent (see below)
 - **`VC`** — a volatility-contraction score (see below)
+- **`VCRank`** — the cross-symbol-comparable percentile of `VC` (see below)
 
 The two EMA periods come from the `vcp` section of `vcp.json`
 (`ema_short_period`, `ema_long_period`; defaults 10 and 20). EMAs use the
 standard `ewm(span=period, adjust=False)` (seeded at the first value). Full
-columns: `Open, High, Low, Close, Volume, Range` + the 6 EMAs + `ADR` + `VC`.
+columns: `Open, High, Low, Close, Volume, Range` + the 6 EMAs + `ADR` + `VC` +
+`VCRank`.
 
 #### The `ADR` score
 
@@ -180,6 +186,28 @@ default `1.0`). The product is flipped via `1 − …` so the sign reads intuiti
 `alpha` / `beta` weight the two dimensions; setting one to `0` drops that factor
 out entirely (it becomes a constant `1`), leaving a pure range- or volume-based
 score.
+
+#### The `VCRank` score
+
+Raw `VC` is self-normalising in its *centre* (≈ 0 for every ticker) but not in
+its *amplitude* — a spiky name swings far wider than a calm one, so a fixed `VC`
+cutoff means different things on different symbols. `VCRank` fixes this by
+ranking today's `VC` against **that symbol's own recent history**:
+
+```
+VCRank = causal percentile (0–100) of VC within the trailing vc_rank_period days
+```
+
+It only looks at the trailing window (no look-ahead, so it's backtest-safe), and
+answers "how contracted is this name **right now vs. its own norm**" — a quantity
+that *is* comparable across symbols, unlike raw `VC`. Higher = more contracted:
+`VCRank = 90` means today's `VC` is in the top 10% of the last `vc_rank_period`
+days. The plot's lower panel draws `VCRank` with a reference line and green
+shading at `vc_rank_threshold` (default 80) to mark strong contraction.
+
+> **Minimum history:** `VCRank` needs a full `vc_rank_period` window (default
+> 504 trading days ≈ 2 years). Rows without one are dropped, so a symbol with
+> fewer than `vc_rank_period` price records returns an **empty** DataFrame.
 
 > Note: `vcp.get_symbol_price_data` takes **one** `symbol` and returns a
 > `DataFrame`; `data.get_symbol_price_data` takes a list of `symbols` and returns

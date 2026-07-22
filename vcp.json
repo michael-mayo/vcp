@@ -16,6 +16,7 @@
     "adr_period": 20,
     "alpha": 1.0,
     "beta": 1.0,
-    "vc_rank_period": 504
+    "vc_rank_period": 504,
+    "vc_rank_threshold": 80
   }
 }

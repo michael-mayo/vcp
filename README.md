@@ -46,6 +46,7 @@ All programs read shared settings from `vcp.json`:
     "adr_period": 20,
     "alpha": 1.0,
     "beta": 1.0,
+    "gamma": 5.0,
     "vc_rank_period": 504,
     "vc_rank_threshold": 80
   }
@@ -59,10 +60,11 @@ All programs read shared settings from `vcp.json`:
   Yahoo Finance download (concurrency, retries, and the rate-limit sweep).
 - **`vcp`** — used by `vcp.get_symbol_price_data`: the two EMA periods
   (`ema_short_period`, `ema_long_period`), the `adr_period` look-back for the
-  `ADR` score, the `alpha` / `beta` exponents (both default `1.0`) that weight
-  the Range and Volume terms of the `VC` score, and the `vc_rank_period` /
-  `vc_rank_threshold` settings for the `VCRank` percentile (trailing window and
-  the plot's strong-contraction line; defaults `504` and `80`).
+  `ADR` score, the `alpha` / `beta` / `gamma` exponents for the `VC` score
+  (weighting the Range, Volume, and trend-penalty terms; `alpha`/`beta` default
+  `1.0`, `gamma` defaults `5.0` — enough to demote trend-driven contraction), and
+  the `vc_rank_period` / `vc_rank_threshold` settings for the `VCRank` percentile
+  (trailing window and the plot's strong-contraction line; defaults `504`, `80`).
 
 ---
 
@@ -171,21 +173,29 @@ to their own longer-term baselines:
 ```
 VC = 1 − (Range_EMA_short / Range_EMA_long) ** alpha
        × (Volume_EMA_short / Volume_EMA_long) ** beta
+       × (1 + |Close_EMA_short / Close_EMA_long − 1|) ** gamma
 ```
 
-Each factor is a fast/slow EMA ratio centred on 1 (recent vs. baseline), raised
-to its exponent from `vcp.json` (`alpha` for range, `beta` for volume; both
-default `1.0`). The product is flipped via `1 − …` so the sign reads intuitively:
+The first two factors are fast/slow EMA ratios centred on 1 (recent vs. baseline)
+— below 1 means that dimension is contracting. The third is a **trend penalty**:
+`|Close_EMA_short/Close_EMA_long − 1|` is ≈0 when price goes sideways and grows
+when it trends (up *or* down), so `(1 + …)^gamma ≥ 1` pushes the product up (and
+`VC` down) during directional moves. Without it, a smooth low-volatility *rally*
+reads as contraction (range and volume genuinely shrink); the penalty keeps `VC`
+high only when price is **also** going sideways — a truer VCP base. The product
+is flipped via `1 − …` so the sign reads intuitively:
 
-- **`VC > 0`** → range **and** volume are contracting (the product < 1) — the
-  quiet, tightening state a VCP setup is built on.
-- **`VC < 0`** → expansion (elevated range and/or volume) — e.g. a high-volume
-  breakout or sharp selloff.
+- **`VC > 0`** → range **and** volume are contracting while price goes sideways —
+  the quiet, tightening state a VCP setup is built on.
+- **`VC < 0`** → expansion (elevated range/volume) or a strong trend.
 - **`VC ≈ 0`** → neutral (recent ≈ baseline).
 
-`alpha` / `beta` weight the two dimensions; setting one to `0` drops that factor
-out entirely (it becomes a constant `1`), leaving a pure range- or volume-based
-score.
+Each exponent comes from `vcp.json`: `alpha` (range), `beta` (volume), `gamma`
+(trend penalty). Setting one to `0` drops that factor out (it becomes a constant
+`1`). Note `gamma` lives on a **larger scale** than `alpha`/`beta`: the Close
+10/20 EMA spread is only a few percent, so `gamma` defaults to `5.0` (a `1.0`
+setting is barely perceptible); raise it further to demote trend-driven
+contraction zones harder, or set it to `0` to disable the trend penalty.
 
 #### The `VCRank` score
 

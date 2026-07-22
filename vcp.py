@@ -54,6 +54,8 @@ ADR_PERIOD = 20  # fallback if not in vcp.json ("vcp.adr_period")
 # Exponents applied to the Range and Volume EMA ratios when forming the VC column.
 VC_ALPHA = 1.0  # fallback if not in vcp.json ("vcp.alpha")
 VC_BETA = 1.0   # fallback if not in vcp.json ("vcp.beta")
+# Exponent on the trend-penalty term (1 + |Close EMA spread|); 0 disables it.
+VC_GAMMA = 0.0  # fallback if not in vcp.json ("vcp.gamma")
 
 # Trailing window (trading days) for the VCRank percentile of VC.
 VC_RANK_PERIOD = 504  # fallback if not in vcp.json ("vcp.vc_rank_period")
@@ -101,9 +103,12 @@ def get_symbol_price_data(
         (the initial ``adr_period - 1`` warm-up rows without a full window are
         dropped) — and ``VC`` — the volatility-contraction score
         ``1 - (Range_EMA_short/Range_EMA_long)**alpha *
-        (Volume_EMA_short/Volume_EMA_long)**beta`` (``alpha``/``beta`` from the
-        ``vcp`` config section); positive/high when range and volume are
-        contracting. A final ``VCRank`` column gives the causal percentile
+        (Volume_EMA_short/Volume_EMA_long)**beta *
+        (1 + |Close_EMA_short/Close_EMA_long - 1|)**gamma``
+        (``alpha``/``beta``/``gamma`` from the ``vcp`` config section; ``gamma``
+        defaults to ``0``, disabling the trend penalty); positive/high when range
+        and volume are contracting while price goes sideways. A final ``VCRank``
+        column gives the causal percentile
         (0-100) of ``VC`` within the trailing ``vcp.vc_rank_period`` window,
         making it comparable across symbols. Rows without a full VCRank window
         are dropped, so a symbol with fewer than ``vc_rank_period`` price records
@@ -131,14 +136,19 @@ def get_symbol_price_data(
     df = df.dropna(subset=["ADR"])
 
     # Volatility-contraction score: fast/slow EMA ratios of Range and Volume,
-    # each raised to its configured exponent and multiplied, then flipped to
-    # 1 - product so that VC is positive/high when range and volume are
-    # contracting (product < 1) and negative when they expand (product > 1).
+    # each raised to its configured exponent, times a trend-penalty term
+    # (1 + |Close EMA spread|)**gamma that grows when price is trending (up or
+    # down) so directional grinds don't register as contraction. The product is
+    # flipped to 1 - product so VC is positive/high when range and volume are
+    # contracting AND price is going sideways, and negative otherwise.
     alpha = config.get("vcp.alpha", VC_ALPHA)
     beta = config.get("vcp.beta", VC_BETA)
+    gamma = config.get("vcp.gamma", VC_GAMMA)
+    trend_spread = (df["Close_EMA_short"] / df["Close_EMA_long"] - 1.0).abs()
     df["VC"] = 1.0 - (
         (df["Range_EMA_short"] / df["Range_EMA_long"]) ** alpha
         * (df["Volume_EMA_short"] / df["Volume_EMA_long"]) ** beta
+        * (1.0 + trend_spread) ** gamma
     )
 
     # VCRank: causal percentile (0-100) of today's VC within the trailing

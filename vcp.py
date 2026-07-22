@@ -9,6 +9,8 @@ OHLCV price history (via :mod:`data`) and enriches it with:
   * ``ADR``               — Average Daily Range percent over ``adr_period`` days
   * ``VC``                — volatility-contraction score combining the fast/slow
                             Range and Volume EMA ratios (see below)
+  * ``VCRank``            — causal percentile of ``VC`` over ``vc_rank_period``
+                            days, making it comparable across symbols
 
 The two EMA periods are read from the ``vcp`` section of ``vcp.json``
 (``ema_short_period`` / ``ema_long_period``); the ``VC`` exponents come from the
@@ -53,6 +55,9 @@ ADR_PERIOD = 20  # fallback if not in vcp.json ("vcp.adr_period")
 VC_ALPHA = 1.0  # fallback if not in vcp.json ("vcp.alpha")
 VC_BETA = 1.0   # fallback if not in vcp.json ("vcp.beta")
 
+# Trailing window (trading days) for the VCRank percentile of VC.
+VC_RANK_PERIOD = 504  # fallback if not in vcp.json ("vcp.vc_rank_period")
+
 
 # --------------------------------------------------------------------------- #
 # Public API
@@ -95,7 +100,11 @@ def get_symbol_price_data(
         ``1 - (Range_EMA_short/Range_EMA_long)**alpha *
         (Volume_EMA_short/Volume_EMA_long)**beta`` (``alpha``/``beta`` from the
         ``vcp`` config section); positive/high when range and volume are
-        contracting. Empty if no price data is available for ``symbol``.
+        contracting. A final ``VCRank`` column gives the causal percentile
+        (0-100) of ``VC`` within the trailing ``vcp.vc_rank_period`` window,
+        making it comparable across symbols. Rows without a full VCRank window
+        are dropped, so a symbol with fewer than ``vc_rank_period`` price records
+        returns an empty frame; likewise if no price data is available.
     """
     prices = data.get_symbol_price_data(symbols=[symbol], refresh=refresh)
     # One symbol in -> one frame out; grab it regardless of the dict key.
@@ -129,7 +138,17 @@ def get_symbol_price_data(
         * (df["Volume_EMA_short"] / df["Volume_EMA_long"]) ** beta
     )
 
-    if plot_filename:
+    # VCRank: causal percentile (0-100) of today's VC within the trailing
+    # window, making VC comparable across symbols. Needs a full window of
+    # history, so rows without one are dropped -- a symbol with fewer than
+    # vc_rank_period records therefore yields an empty frame.
+    rank_period = config.get("vcp.vc_rank_period", VC_RANK_PERIOD)
+    df["VCRank"] = df["VC"].rolling(rank_period).apply(
+        lambda w: (w <= w[-1]).mean() * 100.0, raw=True
+    )
+    df = df.dropna(subset=["VCRank"])
+
+    if plot_filename and not df.empty:
         _save_close_ema_plot(
             df, symbol, plot_filename, plot_from_rec, plot_to_rec, short, long
         )
@@ -182,13 +201,14 @@ def _save_close_ema_plot(
     ax_price.legend()
     ax_price.grid(True, alpha=0.3)
 
-    ax_vc.plot(window.index, window["VC"], label="VC", color="tab:purple", linewidth=1.0)
-    ax_vc.axhline(0.0, color="black", linewidth=0.8)  # contraction / expansion boundary
-    # Shade the contraction region (VC > 0) green.
-    ax_vc.fill_between(window.index, window["VC"], 0.0, where=window["VC"] > 0,
+    ax_vc.plot(window.index, window["VCRank"], label="VCRank", color="tab:purple", linewidth=1.0)
+    ax_vc.axhline(50.0, color="black", linewidth=0.8)  # median: above = more contracted than usual
+    # Shade the above-median contraction region (VCRank > 50) green.
+    ax_vc.fill_between(window.index, window["VCRank"], 50.0, where=window["VCRank"] > 50,
                        color="tab:green", alpha=0.25, interpolate=True,
                        label="contraction")
-    ax_vc.set_ylabel("VC")
+    ax_vc.set_ylabel("VCRank")
+    ax_vc.set_ylim(0, 100)
     ax_vc.set_xlabel("Date")
     ax_vc.legend(loc="upper left")
     ax_vc.grid(True, alpha=0.3)

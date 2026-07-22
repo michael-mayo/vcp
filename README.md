@@ -8,7 +8,7 @@ Patterns. Two modules, each usable from Python and the command line:
 |---|---|---|
 | `data` | `get_symbols` | The universe of US stocks + metadata, filtered per `vcp.json` |
 | `data` | `get_symbol_price_data` | ~20 years of daily OHLCV for one or more symbols |
-| `vcp` | `get_symbol_price_data` | One symbol's OHLCV enriched with Range, EMAs, a VC score, and optional plotting |
+| `vcp` | `get_symbol_price_data` | One symbol's OHLCV enriched with EMAs, ADR%, contraction signals & a `VCP` score, plus optional plotting |
 
 ## Setup
 
@@ -44,11 +44,7 @@ All programs read shared settings from `vcp.json`:
     "ema_short_period": 10,
     "ema_long_period": 20,
     "adr_period": 20,
-    "alpha": 1.0,
-    "beta": 1.0,
-    "gamma": 5.0,
-    "vc_rank_period": 504,
-    "vc_rank_threshold": 80
+    "signal_rank_period": 500
   }
 }
 ```
@@ -59,12 +55,10 @@ All programs read shared settings from `vcp.json`:
 - **`price`** — `history_years` sets the download look-back; the rest tune the
   Yahoo Finance download (concurrency, retries, and the rate-limit sweep).
 - **`vcp`** — used by `vcp.get_symbol_price_data`: the two EMA periods
-  (`ema_short_period`, `ema_long_period`), the `adr_period` look-back for the
-  `ADR` score, the `alpha` / `beta` / `gamma` exponents for the `VC` score
-  (weighting the Range, Volume, and trend-penalty terms; `alpha`/`beta` default
-  `1.0`, `gamma` defaults `5.0` — enough to demote trend-driven contraction), and
-  the `vc_rank_period` / `vc_rank_threshold` settings for the `VCRank` percentile
-  (trailing window and the plot's strong-contraction line; defaults `504`, `80`).
+  (`ema_short_period`, `ema_long_period`; defaults `10`, `20`), the
+  `adr_period` look-back for the `ADR` score (default `20`), and
+  `signal_rank_period` — the trailing window (trading days) for the percentile
+  rank of each signal line and of the composite `VCP` (default `500`).
 
 ---
 
@@ -134,24 +128,25 @@ python data.py get_symbol_price_data symbols=all refresh=True
 
 ---
 
-## 3. `vcp.get_symbol_price_data` — Range, EMAs, ADR, VC & VCRank
+## 3. `vcp.get_symbol_price_data` — EMAs, ADR & signal lines
 
 The analysis layer. Loads a **single** symbol's adjusted OHLCV (via
 `data.get_symbol_price_data`) and adds derived columns:
 
-- **`Range`** = `High − Low` (daily high-low range)
-- **Short- and long-period EMAs** of `Close`, `Range`, and `Volume`:
-  `Close_EMA_short`, `Close_EMA_long`, `Range_EMA_short`, `Range_EMA_long`,
-  `Volume_EMA_short`, `Volume_EMA_long`
+- **Short- and long-period EMAs** of `High`, `Low`, `Close` and `Volume`:
+  `High_EMA_short`, `High_EMA_long`, `Low_EMA_short`, `Low_EMA_long`,
+  `Close_EMA_short`, `Close_EMA_long`, `Volume_EMA_short`, `Volume_EMA_long`
 - **`ADR`** — Average Daily Range percent (see below)
-- **`VC`** — a volatility-contraction score (see below)
-- **`VCRank`** — the cross-symbol-comparable percentile of `VC` (see below)
+- **`Signal_Low`, `Signal_Volume`, `Signal_High`** — three contraction signals,
+  each a 0–100 percentile rank (see below)
+- **`VCP`** — composite contraction score (product of the three signals)
+- **`VCP_Rank`** — percentile rank of `VCP`, comparable across symbols
 
-The two EMA periods come from the `vcp` section of `vcp.json`
-(`ema_short_period`, `ema_long_period`; defaults 10 and 20). EMAs use the
-standard `ewm(span=period, adjust=False)` (seeded at the first value). Full
-columns: `Open, High, Low, Close, Volume, Range` + the 6 EMAs + `ADR` + `VC` +
-`VCRank`.
+The EMA periods come from the `vcp` section of `vcp.json` (`ema_short_period`,
+`ema_long_period`; defaults 10 and 20). EMAs use the standard
+`ewm(span=period, adjust=False)` (seeded at the first value). Full columns:
+`Open, High, Low, Close, Volume` + the 8 EMAs + `ADR` + `Signal_Low` +
+`Signal_Volume` + `Signal_High` + `VCP` + `VCP_Rank`.
 
 #### The `ADR` score
 
@@ -163,61 +158,68 @@ ADR = 100 × (meanₙ(High / Low) − 1)
 ```
 
 A higher value means a wider-swinging (more volatile) stock. It's a common
-liquidity/volatility filter in VCP screening.
+liquidity/volatility filter in VCP screening. The initial `adr_period − 1`
+warm-up rows without a full window are dropped.
 
-#### The `VC` score
+#### The signal lines
 
-`VC` combines how much recent **range** and **volume** have contracted relative
-to their own longer-term baselines:
-
-```
-VC = 1 − (Range_EMA_short / Range_EMA_long) ** alpha
-       × (Volume_EMA_short / Volume_EMA_long) ** beta
-       × (1 + |Close_EMA_short / Close_EMA_long − 1|) ** gamma
-```
-
-The first two factors are fast/slow EMA ratios centred on 1 (recent vs. baseline)
-— below 1 means that dimension is contracting. The third is a **trend penalty**:
-`|Close_EMA_short/Close_EMA_long − 1|` is ≈0 when price goes sideways and grows
-when it trends (up *or* down), so `(1 + …)^gamma ≥ 1` pushes the product up (and
-`VC` down) during directional moves. Without it, a smooth low-volatility *rally*
-reads as contraction (range and volume genuinely shrink); the penalty keeps `VC`
-high only when price is **also** going sideways — a truer VCP base. The product
-is flipped via `1 − …` so the sign reads intuitively:
-
-- **`VC > 0`** → range **and** volume are contracting while price goes sideways —
-  the quiet, tightening state a VCP setup is built on.
-- **`VC < 0`** → expansion (elevated range/volume) or a strong trend.
-- **`VC ≈ 0`** → neutral (recent ≈ baseline).
-
-Each exponent comes from `vcp.json`: `alpha` (range), `beta` (volume), `gamma`
-(trend penalty). Setting one to `0` drops that factor out (it becomes a constant
-`1`). Note `gamma` lives on a **larger scale** than `alpha`/`beta`: the Close
-10/20 EMA spread is only a few percent, so `gamma` defaults to `5.0` (a `1.0`
-setting is barely perceptible); raise it further to demote trend-driven
-contraction zones harder, or set it to `0` to disable the trend penalty.
-
-#### The `VCRank` score
-
-Raw `VC` is self-normalising in its *centre* (≈ 0 for every ticker) but not in
-its *amplitude* — a spiky name swings far wider than a calm one, so a fixed `VC`
-cutoff means different things on different symbols. `VCRank` fixes this by
-ranking today's `VC` against **that symbol's own recent history**:
+Three signals aim to detect a **compression of range** — a tightening base —
+rather than a trend. Each is first built from a short/long EMA ratio through
+`f(x, y) = exp(x / y)`, then converted to a **causal percentile rank (0–100)**
+over the trailing `signal_rank_period` window (default 500). The exponential is
+just a positive, monotonic rescaling; ranking is what does the real work —
+it puts all three on a common, self-normalising 0–100 scale so no single one
+dominates:
 
 ```
-VCRank = causal percentile (0–100) of VC within the trailing vc_rank_period days
+Signal_Low    = pct_rank( exp(Low_EMA_short  / Low_EMA_long) )
+Signal_Volume = pct_rank( exp(Volume_EMA_long / Volume_EMA_short) )
+Signal_High   = pct_rank( min( exp(High_EMA_short / High_EMA_long),
+                               exp(High_EMA_long  / High_EMA_short) ) )
 ```
 
-It only looks at the trailing window (no look-ahead, so it's backtest-safe), and
-answers "how contracted is this name **right now vs. its own norm**" — a quantity
-that *is* comparable across symbols, unlike raw `VC`. Higher = more contracted:
-`VCRank = 90` means today's `VC` is in the top 10% of the last `vc_rank_period`
-days. The plot's lower panel draws `VCRank` with a reference line and green
-shading at `vc_rank_threshold` (default 80) to mark strong contraction.
+- **`Signal_Low`** is **directional**: high when recent lows sit above their
+  longer-run average → **the floor is rising**.
+- **`Signal_Volume`** inverts the ratio (long/short): high when recent volume is
+  *below* its baseline → **volume is drying up**; it drops on volume surges.
+- **`Signal_High`** is **symmetric** (`min(r, 1/r)` peaks at `r = 1`): high only
+  when the fast and slow high-EMAs coincide → **the ceiling is flat**. It falls
+  whenever the highs trend in *either* direction, so it acts as a trend rejector.
 
-> **Minimum history:** `VCRank` needs a full `vc_rank_period` window (default
-> 504 trading days ≈ 2 years). Rows without one are dropped, so a symbol with
-> fewer than `vc_rank_period` price records returns an **empty** DataFrame.
+Together they capture a VCP coil: a **rising floor into a flat ceiling on
+drying-up volume**. A genuine uptrend (highs *and* lows rising) is rejected
+because rising highs collapse `Signal_High`.
+
+Each rank uses only its trailing window (no look-ahead, so it's backtest-safe).
+The warm-up rows without a full window are dropped; if a symbol has too few
+records to fill one window, `get_symbol_price_data` raises `ValueError`.
+
+#### The `VCP` and `VCP_Rank` scores
+
+`VCP` is the composite — the three signals must line up *at once* for it to be
+high, so it's a **product** (an additive blend would let a strong signal mask a
+weak one). Each rank is scaled to 0–1 and the product rescaled to 0–100:
+
+```
+VCP = (Signal_Low / 100) × (Signal_Volume / 100) × Signal_High
+```
+
+Because each input is a self-normalised rank, `VCP` is already far more
+comparable across symbols than a raw product would be. But a product's
+distribution still depends on how the three signals *co-move*, which varies by
+symbol. `VCP_Rank` removes that last dependence by ranking `VCP` against its own
+history the same way the signals are ranked:
+
+```
+VCP_Rank = pct_rank(VCP)   over the trailing signal_rank_period window
+```
+
+`VCP_Rank = 90` means today's compression is in the top 10% of this symbol's own
+recent history — a statement that holds identically on every ticker, so it's the
+line to use for a single cross-symbol cutoff. Note that ranking `VCP` needs a
+full window *on top of* the signal warm-up, so `VCP_Rank` requires roughly
+**two stacked `signal_rank_period` windows** of history (its warm-up rows are
+dropped too).
 
 > Note: `vcp.get_symbol_price_data` takes **one** `symbol` and returns a
 > `DataFrame`; `data.get_symbol_price_data` takes a list of `symbols` and returns
@@ -231,7 +233,7 @@ import vcp
 df = vcp.get_symbol_price_data("MSFT")                # from cache
 df = vcp.get_symbol_price_data("MSFT", refresh=True)  # force re-download
 
-# Also save a two-panel chart (Close + EMAs on top, VC below):
+# Also save a three-panel chart (Close + EMAs, ADR%, then the signal ranks + VCP_Rank):
 df = vcp.get_symbol_price_data("MSFT", plot_filename="msft.png")
 df = vcp.get_symbol_price_data("MSFT", plot_filename="msft.png",
                                plot_from_rec=-100, plot_to_rec=-1)
@@ -251,9 +253,10 @@ python vcp.py get_symbol_price_data symbol=MSFT refresh=True
 
 Prints the enriched table with a record-count / date-range footer.
 
-Pass `plot_filename=...` to save a two-panel chart (Close + EMAs on top, the VC
-score below) instead of just printing; `plot_from_rec` / `plot_to_rec` select the
-record range (defaults `-252` to `-1`, i.e. the last ~year):
+Pass `plot_filename=...` to save a three-panel chart (Close + EMAs, ADR%, then
+the three signal ranks with `VCP_Rank` overlaid) instead of just printing;
+`plot_from_rec` / `plot_to_rec` select the record range (defaults `-252` to
+`-1`, i.e. the last ~year):
 
 ```bash
 python vcp.py get_symbol_price_data symbol=MSFT plot_filename=msft.png

@@ -3,18 +3,24 @@
 Provides :func:`get_symbol_price_data`, which loads a symbol's adjusted daily
 OHLCV price history (via :mod:`data`) and enriches it with:
 
-  * ``Range``             — the daily high-low range (High - Low)
-  * ``<src>_EMA_short``   — short-period EMA of ``Close``, ``Range``, ``Volume``
-  * ``<src>_EMA_long``    — long-period EMA of ``Close``, ``Range``, ``Volume``
+  * ``<src>_EMA_short``   — short-period EMA of ``High``, ``Low``, ``Close`` and ``Volume``
+  * ``<src>_EMA_long``    — long-period EMA of ``High``, ``Low``, ``Close`` and ``Volume``
   * ``ADR``               — Average Daily Range percent over ``adr_period`` days
-  * ``VC``                — volatility-contraction score combining the fast/slow
-                            Range and Volume EMA ratios (see below)
-  * ``VCRank``            — causal percentile of ``VC`` over ``vc_rank_period``
-                            days, making it comparable across symbols
+  * ``Signal_Low``        — percentile rank of ``exp(Low_EMA_short/Low_EMA_long)``
+                            (high when the daily lows are rising)
+  * ``Signal_Volume``     — percentile rank of ``exp(Volume_EMA_long/Volume_EMA_short)``
+                            (high when volume is drying up)
+  * ``Signal_High``       — percentile rank of the symmetric high-EMA ratio
+                            (high when the daily highs are going sideways)
+  * ``VCP``               — composite contraction score, the product of the
+                            three signal ranks (0-100)
+  * ``VCP_Rank``          — percentile rank of ``VCP``, comparable across symbols
 
-The two EMA periods are read from the ``vcp`` section of ``vcp.json``
-(``ema_short_period`` / ``ema_long_period``); the ``VC`` exponents come from the
-same section (``alpha`` / ``beta``, both default ``1.0``).
+Each signal is ranked over the trailing ``signal_rank_period`` window so it is
+self-normalising per symbol; ``VCP_Rank`` ranks the composite the same way. The
+EMA periods, ADR look-back and ranking window are all read from the ``vcp``
+section of ``vcp.json`` (``ema_short_period`` / ``ema_long_period`` /
+``adr_period`` / ``signal_rank_period``).
 
 Usage
 -----
@@ -28,7 +34,7 @@ Command line::
     python vcp.py get_symbol_price_data symbol=MSFT refresh=True
     python vcp.py get_symbol_price_data symbol=MSFT        # refresh defaults to False
 
-    # Save a Close + EMA plot of the last 252 records instead of printing:
+    # Save a three-panel plot of the last 252 records instead of printing:
     python vcp.py get_symbol_price_data symbol=MSFT plot_filename=msft.png
     python vcp.py get_symbol_price_data symbol=MSFT plot_filename=msft.png \
         plot_from_rec=-100 plot_to_rec=-1
@@ -38,30 +44,24 @@ from __future__ import annotations
 
 import sys
 
+import numpy as np
 import pandas as pd
 
 import data
 import config
 
-# A short- and long-period EMA is computed for each of these columns.
-EMA_SOURCES = ("Close", "Range", "Volume")
+# A short- and long-period EMA is computed for each of these columns, in order
+# (High/Low EMAs land before the Close EMAs in the output frame).
+EMA_SOURCES = ("High", "Low", "Close", "Volume")
 EMA_SHORT_PERIOD = 10  # fallback if not in vcp.json ("vcp.ema_short_period")
 EMA_LONG_PERIOD = 20   # fallback if not in vcp.json ("vcp.ema_long_period")
 
 # Look-back for the Average Daily Range percent (ADR) column.
 ADR_PERIOD = 20  # fallback if not in vcp.json ("vcp.adr_period")
 
-# Exponents applied to the Range and Volume EMA ratios when forming the VC column.
-VC_ALPHA = 1.0  # fallback if not in vcp.json ("vcp.alpha")
-VC_BETA = 1.0   # fallback if not in vcp.json ("vcp.beta")
-# Exponent on the trend-penalty term (1 + |Close EMA spread|); 0 disables it.
-VC_GAMMA = 0.0  # fallback if not in vcp.json ("vcp.gamma")
-
-# Trailing window (trading days) for the VCRank percentile of VC.
-VC_RANK_PERIOD = 504  # fallback if not in vcp.json ("vcp.vc_rank_period")
-
-# VCRank level marking "strong contraction" (drawn as the plot's reference line).
-VC_RANK_THRESHOLD = 80  # fallback if not in vcp.json ("vcp.vc_rank_threshold")
+# Trailing window (trading days) for the percentile rank of each Signal line
+# (and of the composite VCP score that feeds VCP_Rank).
+SIGNAL_RANK_PERIOD = 500  # fallback if not in vcp.json ("vcp.signal_rank_period")
 
 
 # --------------------------------------------------------------------------- #
@@ -74,7 +74,7 @@ def get_symbol_price_data(
     plot_from_rec: int = -252,
     plot_to_rec: int = -1,
 ) -> pd.DataFrame:
-    """Return adjusted daily OHLCV for ``symbol`` with Range and EMA columns.
+    """Return adjusted daily OHLCV for ``symbol`` with EMA and ADR columns.
 
     Parameters
     ----------
@@ -84,9 +84,9 @@ def get_symbol_price_data(
         Passed through to :func:`data.get_symbol_price_data` — ``True`` forces a
         re-download, ``False`` (default) uses the cache when present.
     plot_filename:
-        If given, a Close-price plot (with the short and long Close EMAs) is
-        saved to this path (format inferred from the extension, e.g. ``.png``).
-        When ``None`` (default) no plot is produced.
+        If given, a three-panel plot (Close + Close EMAs, ADR%, and the signal
+        ranks with VCP_Rank) is saved to this path (format inferred from the
+        extension, e.g. ``.png``). When ``None`` (default) no plot is produced.
     plot_from_rec, plot_to_rec:
         Inclusive record range to plot, as positions into the date-sorted frame.
         Negative values count from the end (``-1`` is the last record), positive
@@ -97,22 +97,34 @@ def get_symbol_price_data(
     Returns
     -------
     pandas.DataFrame
-        Indexed by ``Date`` with columns ``Open, High, Low, Close, Volume,
-        Range``, the EMA columns (e.g. ``Close_EMA_short``, ``Volume_EMA_long``),
+        Indexed by ``Date`` with columns ``Open, High, Low, Close, Volume``,
+        the EMA columns (``High``/``Low``/``Close``/``Volume`` each with a
+        ``_EMA_short`` and ``_EMA_long``, in that order), and
         ``ADR`` — the Average Daily Range percent over ``vcp.adr_period`` days
         (the initial ``adr_period - 1`` warm-up rows without a full window are
-        dropped) — and ``VC`` — the volatility-contraction score
-        ``1 - (Range_EMA_short/Range_EMA_long)**alpha *
-        (Volume_EMA_short/Volume_EMA_long)**beta *
-        (1 + |Close_EMA_short/Close_EMA_long - 1|)**gamma``
-        (``alpha``/``beta``/``gamma`` from the ``vcp`` config section; ``gamma``
-        defaults to ``0``, disabling the trend penalty); positive/high when range
-        and volume are contracting while price goes sideways. A final ``VCRank``
-        column gives the causal percentile
-        (0-100) of ``VC`` within the trailing ``vcp.vc_rank_period`` window,
-        making it comparable across symbols. Rows without a full VCRank window
-        are dropped, so a symbol with fewer than ``vc_rank_period`` price records
-        returns an empty frame; likewise if no price data is available.
+        dropped) — and three signal lines. Each signal is first built from the
+        EMA ratios via ``f(x, y) = exp(x / y)`` — ``Signal_Low`` =
+        ``f(Low_EMA_short, Low_EMA_long)``, ``Signal_Volume`` =
+        ``f(Volume_EMA_long, Volume_EMA_short)``, ``Signal_High`` =
+        ``min(f(High_EMA_short, High_EMA_long), f(High_EMA_long,
+        High_EMA_short))`` — then converted to a causal percentile rank (0-100)
+        over the shared trailing ``vcp.signal_rank_period`` window, so the three
+        share a common scale. The warm-up rows without a full ranking window are
+        dropped. A ``VCP`` column is the composite contraction score
+        ``(Signal_Low/100) * (Signal_Volume/100) * Signal_High`` (the product of
+        the three ranks scaled to 0-100; high only when all three signals rank
+        high at once), and ``VCP_Rank`` is the causal percentile (0-100) of
+        ``VCP`` over the same ``vcp.signal_rank_period`` window, making the
+        composite comparable across symbols (its warm-up rows are dropped too,
+        so a full ``VCP_Rank`` needs two stacked ranking windows of history). An
+        empty frame is returned if no price data is available.
+
+    Raises
+    ------
+    ValueError
+        If price data exists but there are too few daily records to fill a
+        single ``vcp.signal_rank_period`` window (so no signal ranks can be
+        computed).
     """
     prices = data.get_symbol_price_data(symbols=[symbol], refresh=refresh)
     # One symbol in -> one frame out; grab it regardless of the dict key.
@@ -123,7 +135,6 @@ def get_symbol_price_data(
     short = config.get("vcp.ema_short_period", EMA_SHORT_PERIOD)
     long = config.get("vcp.ema_long_period", EMA_LONG_PERIOD)
 
-    df["Range"] = df["High"] - df["Low"]
     for source in EMA_SOURCES:
         df[f"{source}_EMA_short"] = df[source].ewm(span=short, adjust=False).mean()
         df[f"{source}_EMA_long"] = df[source].ewm(span=long, adjust=False).mean()
@@ -135,39 +146,64 @@ def get_symbol_price_data(
     # Drop the early warm-up rows that lack a full ADR window.
     df = df.dropna(subset=["ADR"])
 
-    # Volatility-contraction score: fast/slow EMA ratios of Range and Volume,
-    # each raised to its configured exponent, times a trend-penalty term
-    # (1 + |Close EMA spread|)**gamma that grows when price is trending (up or
-    # down) so directional grinds don't register as contraction. The product is
-    # flipped to 1 - product so VC is positive/high when range and volume are
-    # contracting AND price is going sideways, and negative otherwise.
-    alpha = config.get("vcp.alpha", VC_ALPHA)
-    beta = config.get("vcp.beta", VC_BETA)
-    gamma = config.get("vcp.gamma", VC_GAMMA)
-    trend_spread = (df["Close_EMA_short"] / df["Close_EMA_long"] - 1.0).abs()
-    df["VC"] = 1.0 - (
-        (df["Range_EMA_short"] / df["Range_EMA_long"]) ** alpha
-        * (df["Volume_EMA_short"] / df["Volume_EMA_long"]) ** beta
-        * (1.0 + trend_spread) ** gamma
+    # Signal lines built from the EMA ratios via f(x, y) = exp(x / y), then
+    # converted to a causal percentile rank (0-100) over a shared trailing
+    # window so the three land on a common, dominance-free scale.
+    df["Signal_Low"] = np.exp(df["Low_EMA_short"] / df["Low_EMA_long"])
+    df["Signal_Volume"] = np.exp(df["Volume_EMA_long"] / df["Volume_EMA_short"])
+    df["Signal_High"] = np.minimum(
+        np.exp(df["High_EMA_short"] / df["High_EMA_long"]),
+        np.exp(df["High_EMA_long"] / df["High_EMA_short"]),
     )
+    rank_period = config.get("vcp.signal_rank_period", SIGNAL_RANK_PERIOD)
+    signal_cols = ["Signal_Low", "Signal_Volume", "Signal_High"]
+    for col in signal_cols:
+        df[col] = _causal_pct_rank(df[col], rank_period)
+    # Drop the warm-up rows that lack a full ranking window; if none survive
+    # there is not enough daily history to compute the signals -- flag it.
+    df = df.dropna(subset=signal_cols)
+    if df.empty:
+        raise ValueError(
+            f"insufficient price history for {symbol!r}: need more than "
+            f"{rank_period} daily records (after the {adr_period}-day ADR "
+            f"warm-up) to compute the signal percentile ranks"
+        )
 
-    # VCRank: causal percentile (0-100) of today's VC within the trailing
-    # window, making VC comparable across symbols. Needs a full window of
-    # history, so rows without one are dropped -- a symbol with fewer than
-    # vc_rank_period records therefore yields an empty frame.
-    rank_period = config.get("vcp.vc_rank_period", VC_RANK_PERIOD)
-    df["VCRank"] = df["VC"].rolling(rank_period).apply(
-        lambda w: (w <= w[-1]).mean() * 100.0, raw=True
-    )
-    df = df.dropna(subset=["VCRank"])
+    # Composite VCP score: product of the three signal ranks (each scaled to
+    # 0-1), rescaled to 0-100 to share the signals' axis. High only when all
+    # three contraction conditions hold at once.
+    df["VCP"] = (df["Signal_Low"] / 100.0) * (df["Signal_Volume"] / 100.0) * df["Signal_High"]
 
-    if plot_filename and not df.empty:
-        threshold = config.get("vcp.vc_rank_threshold", VC_RANK_THRESHOLD)
+    # VCP_Rank: causal percentile of VCP over the same trailing window, making
+    # the composite itself comparable across symbols regardless of how the three
+    # signals co-move. Needs its own full window on top of the signal warm-up.
+    df["VCP_Rank"] = _causal_pct_rank(df["VCP"], rank_period)
+    df = df.dropna(subset=["VCP_Rank"])
+    if df.empty:
+        raise ValueError(
+            f"insufficient price history for {symbol!r}: need more than "
+            f"{2 * rank_period} daily records (after the {adr_period}-day ADR "
+            f"warm-up) to compute VCP_Rank (two stacked {rank_period}-day "
+            f"ranking windows)"
+        )
+
+    if plot_filename:
         _save_close_ema_plot(
             df, symbol, plot_filename, plot_from_rec, plot_to_rec, short, long,
-            threshold,
         )
     return df
+
+
+def _causal_pct_rank(series: pd.Series, window: int) -> pd.Series:
+    """Causal percentile rank (0-100) of each value within its trailing window.
+
+    Uses only the trailing ``window`` observations (no look-ahead), so the
+    result is backtest-safe; the leading ``window - 1`` rows without a full
+    window are left ``NaN``.
+    """
+    return series.rolling(window).apply(
+        lambda w: (w <= w[-1]).mean() * 100.0, raw=True
+    )
 
 
 def _resolve_rec(idx: int, n: int) -> int:
@@ -184,10 +220,11 @@ def _save_close_ema_plot(
     to_rec: int,
     short: int,
     long: int,
-    rank_threshold: float,
 ) -> None:
-    """Save a Close-price + Close-EMA plot of ``df[from_rec:to_rec]`` to disk.
+    """Save a three-panel plot of ``df[from_rec:to_rec]`` to disk.
 
+    Panels share the x-axis: Close + Close EMAs on top, ADR% in the middle, and
+    the three signal ranks with the composite VCP_Rank at the bottom.
     ``from_rec``/``to_rec`` are inclusive record positions (negative counts from
     the end); matplotlib is imported lazily so it is only required when plotting.
     """
@@ -202,10 +239,11 @@ def _save_close_ema_plot(
         start, stop = stop, start
     window = df.iloc[start:stop + 1]
 
-    # Two stacked panels sharing the x-axis: price/EMAs on top, VC below.
-    fig, (ax_price, ax_vc) = plt.subplots(
-        2, 1, figsize=(12, 8), sharex=True,
-        gridspec_kw={"height_ratios": [3, 1]},
+    # Three stacked panels sharing the x-axis: price/EMAs on top, ADR% in the
+    # middle, and the signal lines at the bottom.
+    fig, (ax_price, ax_adr, ax_sig) = plt.subplots(
+        3, 1, figsize=(12, 10), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1, 1]},
     )
 
     ax_price.plot(window.index, window["Close"], label="Close", color="black", linewidth=1.3)
@@ -217,18 +255,22 @@ def _save_close_ema_plot(
     ax_price.legend()
     ax_price.grid(True, alpha=0.3)
 
-    ax_vc.plot(window.index, window["VCRank"], label="VCRank", color="tab:purple", linewidth=1.0)
-    ax_vc.axhline(rank_threshold, color="black", linewidth=0.8)  # strong-contraction threshold
-    # Shade the strong-contraction region (VCRank > threshold) green.
-    ax_vc.fill_between(window.index, window["VCRank"], rank_threshold,
-                       where=window["VCRank"] > rank_threshold,
-                       color="tab:green", alpha=0.25, interpolate=True,
-                       label="contraction")
-    ax_vc.set_ylabel("VCRank")
-    ax_vc.set_ylim(0, 100)
-    ax_vc.set_xlabel("Date")
-    ax_vc.legend(loc="upper left")
-    ax_vc.grid(True, alpha=0.3)
+    ax_adr.plot(window.index, window["ADR"], label="ADR%", color="tab:orange", linewidth=1.0)
+    ax_adr.set_ylabel("ADR %")
+    ax_adr.legend(loc="upper left")
+    ax_adr.grid(True, alpha=0.3)
+
+    # Component signal ranks (faded) with the composite VCP_Rank (bold) on top,
+    # all sharing the same 0-100 axis.
+    ax_sig.plot(window.index, window["Signal_Low"], label="Signal_Low", color="tab:blue", linewidth=0.8, alpha=0.4)
+    ax_sig.plot(window.index, window["Signal_Volume"], label="Signal_Volume", color="tab:green", linewidth=0.8, alpha=0.4)
+    ax_sig.plot(window.index, window["Signal_High"], label="Signal_High", color="tab:red", linewidth=0.8, alpha=0.4)
+    ax_sig.plot(window.index, window["VCP_Rank"], label="VCP_Rank", color="black", linewidth=1.8)
+    ax_sig.set_ylabel("Signal rank / VCP_Rank")
+    ax_sig.set_ylim(0, 100)
+    ax_sig.set_xlabel("Date")
+    ax_sig.legend(loc="upper left", ncol=4)
+    ax_sig.grid(True, alpha=0.3)
 
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -295,7 +337,11 @@ def _main(argv) -> int:
             continue
         kwargs[key] = _coerce(val)
 
-    result = func(**kwargs)
+    try:
+        result = func(**kwargs)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
     _print_symbol(result)
     if kwargs.get("plot_filename") and not result.empty:
         print(f"plot saved to {kwargs['plot_filename']}")

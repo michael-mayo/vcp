@@ -9,5 +9,9 @@
     "max_workers": 4,
     "max_retries": 4,
     "sweep_cooldown": 10
+  },
+  "vcp": {
+    "ema_short_period": 10,
+    "ema_long_period": 20
   }
 }

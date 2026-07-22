@@ -1,14 +1,14 @@
-# vcp — US stock market data
+# vcp — US stock market data & analysis
 
-A small data layer for downloading and caching US stock market data, built on
-the NASDAQ screener, Wikipedia (S&P index membership), and Yahoo Finance.
+Tooling for downloading/caching US stock market data (NASDAQ screener, Wikipedia
+S&P membership, Yahoo Finance) and analysing it for Volatility Contraction
+Patterns. Two modules, each usable from Python and the command line:
 
-It exposes two commands, usable both from Python and the command line:
-
-| Command | What it does |
-|---|---|
-| `get_symbols` | The universe of US stocks + metadata, filtered per `vcp.json` |
-| `get_symbol_price_data` | ~20 years of daily OHLCV for one or more symbols |
+| Module | Command | What it does |
+|---|---|---|
+| `data` | `get_symbols` | The universe of US stocks + metadata, filtered per `vcp.json` |
+| `data` | `get_symbol_price_data` | ~20 years of daily OHLCV for one or more symbols |
+| `vcp` | `get_symbol_price_data` | One symbol's OHLCV enriched with Range and EMAs |
 
 ## Setup
 
@@ -39,6 +39,10 @@ All programs read shared settings from `vcp.json`:
     "max_workers": 4,
     "max_retries": 4,
     "sweep_cooldown": 10
+  },
+  "vcp": {
+    "ema_short_period": 10,
+    "ema_long_period": 20
   }
 }
 ```
@@ -48,6 +52,7 @@ All programs read shared settings from `vcp.json`:
   full universe is cached; filters are applied on read).
 - **`price`** — `history_years` sets the download look-back; the rest tune the
   Yahoo Finance download (concurrency, retries, and the rate-limit sweep).
+- **`vcp`** — the two EMA periods used by `vcp.get_symbol_price_data`.
 
 ---
 
@@ -114,6 +119,47 @@ python data.py get_symbol_price_data symbols=all refresh=True
 ```
 
 `symbols` is a comma-separated list, or `all` for the full filtered universe.
+
+---
+
+## 3. `vcp.get_symbol_price_data` — Range & EMAs
+
+The analysis layer. Loads a **single** symbol's adjusted OHLCV (via
+`data.get_symbol_price_data`) and adds derived columns:
+
+- **`Range`** = `High − Low` (daily high-low range)
+- **Short- and long-period EMAs** of `Close`, `Range`, and `Volume`:
+  `Close_EMA_short`, `Close_EMA_long`, `Range_EMA_short`, `Range_EMA_long`,
+  `Volume_EMA_short`, `Volume_EMA_long`
+
+The two EMA periods come from the `vcp` section of `vcp.json`
+(`ema_short_period`, `ema_long_period`; defaults 10 and 20). EMAs use the
+standard `ewm(span=period, adjust=False)` (seeded at the first value). Full
+columns: `Open, High, Low, Close, Volume, Range` + the 6 EMAs.
+
+> Note: `vcp.get_symbol_price_data` takes **one** `symbol` and returns a
+> `DataFrame`; `data.get_symbol_price_data` takes a list of `symbols` and returns
+> a `dict`. Same name, different module and shape.
+
+### From Python
+
+```python
+import vcp
+
+df = vcp.get_symbol_price_data("MSFT")                # from cache
+df = vcp.get_symbol_price_data("MSFT", refresh=True)  # force re-download
+```
+
+Returns a pandas `DataFrame` indexed by `Date`.
+
+### From the command line
+
+```bash
+python vcp.py get_symbol_price_data symbol=MSFT
+python vcp.py get_symbol_price_data symbol=MSFT refresh=True
+```
+
+Prints the enriched table with a record-count / date-range footer.
 
 ---
 

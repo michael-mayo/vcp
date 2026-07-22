@@ -8,3 +8,6 @@ lxml>=6.1.1           # HTML table parsing for pandas.read_html
 # Price history from Yahoo Finance
 yfinance>=1.5.1
 scipy>=1.18.0         # required by yfinance's repair=True (data-glitch fixes)
+
+# Plotting (Close + EMA charts via get_symbol_price_data plot_filename=...)
+matplotlib>=3.10.0

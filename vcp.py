@@ -89,8 +89,9 @@ def get_symbol_price_data(
     pandas.DataFrame
         Indexed by ``Date`` with columns ``Open, High, Low, Close, Volume,
         Range``, the EMA columns (e.g. ``Close_EMA_short``, ``Volume_EMA_long``),
-        ``ADR`` — the Average Daily Range percent over ``vcp.adr_period`` days —
-        and ``VC`` — the volatility-contraction score
+        ``ADR`` — the Average Daily Range percent over ``vcp.adr_period`` days
+        (the initial ``adr_period - 1`` warm-up rows without a full window are
+        dropped) — and ``VC`` — the volatility-contraction score
         ``1 - (Range_EMA_short/Range_EMA_long)**alpha *
         (Volume_EMA_short/Volume_EMA_long)**beta`` (``alpha``/``beta`` from the
         ``vcp`` config section); positive/high when range and volume are
@@ -114,6 +115,8 @@ def get_symbol_price_data(
     # look-back window, expressed as a percentage (Minervini-style ADR%).
     adr_period = config.get("vcp.adr_period", ADR_PERIOD)
     df["ADR"] = ((df["High"] / df["Low"]).rolling(adr_period).mean() - 1.0) * 100.0
+    # Drop the early warm-up rows that lack a full ADR window.
+    df = df.dropna(subset=["ADR"])
 
     # Volatility-contraction score: fast/slow EMA ratios of Range and Volume,
     # each raised to its configured exponent and multiplied, then flipped to
